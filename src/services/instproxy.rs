@@ -1,13 +1,11 @@
 // jkcoxson
 
 use std::ffi::CString;
-use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
 
 use crate::{bindings as unsafe_bindings, error::InstProxyError, idevice::Device};
 
-use log::info;
+use log::{error, info};
 use plist_plus::Plist;
 
 /// Manages installing, removing and modifying applications on the device
@@ -19,8 +17,6 @@ pub struct InstProxyClient<'a> {
 
 unsafe impl Send for InstProxyClient<'_> {}
 unsafe impl Sync for InstProxyClient<'_> {}
-
-type InstallCallback = Box<dyn Fn(Plist, Plist) -> ()>;
 
 impl InstProxyClient<'_> {
     /// Starts a new service with house arrest
@@ -43,7 +39,7 @@ impl InstProxyClient<'_> {
                 label_c_str.as_ptr(),
             )
         }
-            .into();
+        .into();
 
         if result != InstProxyError::Success {
             return Err(result);
@@ -80,7 +76,7 @@ impl InstProxyClient<'_> {
                 )
             }
         }
-            .into();
+        .into();
 
         if result != InstProxyError::Success {
             return Err(result);
@@ -173,7 +169,7 @@ impl InstProxyClient<'_> {
                 &mut res_plist,
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -197,6 +193,44 @@ impl InstProxyClient<'_> {
         pkg_path: impl Into<String>,
         client_options: Option<Plist>,
     ) -> Result<(), (InstProxyError, String)> {
+        unsafe extern "C" fn install_cb_helper(
+            _command: unsafe_bindings::plist_t,
+            status: unsafe_bindings::plist_t,
+            user_data: *mut ::std::os::raw::c_void,
+        ) {
+            let status: plist::Dictionary = crate::libplist_to_rusty_plist(status);
+
+            let tx = Box::from_raw(user_data as *mut Sender<(InstProxyError, String)>);
+            // We're ignoring completion percentage.
+            if let Some(status) = status.get("Status").and_then(|s| s.as_string()) {
+                if status == "Complete" {
+                    info!("Instproxy install: success");
+                    tx.send((InstProxyError::Success, "".to_string())).expect(
+                        "Installation success cannot be transmitted. This shouldn't happen.",
+                    );
+                }
+            } else {
+                // An error happened!!
+                let error = status
+                    .get("Error")
+                    .and_then(|err| err.as_string())
+                    .unwrap_or("Unknown error");
+                let description = status
+                    .get("ErrorDescription")
+                    .and_then(|err| err.as_string())
+                    .unwrap_or("No further description");
+                let detail = (status
+                    .get("ErrorDetail")
+                    .and_then(|err| err.as_unsigned_integer())
+                    .unwrap_or(u64::MAX) as i32)
+                    .into();
+                error!("Instproxy install: {detail:?} ({error}): {description}");
+                tx.send((detail, description.to_owned()))
+                    .expect("Installation error cannot be transmitted. This shouldn't happen.");
+            }
+            std::mem::forget(tx); // make sure it is not dropped so that it is still valid for consecutive callback calls
+        }
+
         info!("Instproxy install");
         let pkg_path_c_str = std::ffi::CString::new(pkg_path.into()).unwrap();
 
@@ -206,50 +240,28 @@ impl InstProxyClient<'_> {
             std::ptr::null_mut()
         };
 
-        let (tx,rx) = channel();
+        let (tx, rx) = channel();
 
-        let mut error_handler: InstallCallback = Box::new(move |command: Plist, status: Plist| {
-            if let Ok(status) = status.dict_get_item("Status") {
-                if status.get_string_val().ok() == Some("Complete".to_string()) {
-                    tx.send((InstProxyError::Success, "".to_string())).expect("Installation success cannot be transmitted. This shouldn't happen.");
-                }
-                // We're ignoring at completion percentage.
-            } else {
-                // An error happened!!
-                let error = status.dict_get_item("Error")
-                    .and_then(|err| err.get_string_val()).unwrap_or("Unknown error".to_string());
-                let description = status.dict_get_item("ErrorDescription")
-                    .and_then(|err| err.get_string_val()).unwrap_or("No further description".to_string());
-                let detail = status.dict_get_item("ErrorDetail")
-                    .and_then(|err| err.get_uint_val()).unwrap_or(u64::MAX) as i32;
-                tx.send((detail.into(), description)).expect("Installation error cannot be transmitted. This shouldn't happen.");;
-            }
-        });
-
-        let error_box = Box::into_raw(error_handler);
+        let tx_box = Box::into_raw(Box::new(tx));
 
         unsafe {
             unsafe_bindings::instproxy_install(
                 self.pointer,
                 pkg_path_c_str.as_ptr(),
                 ptr,
-                Some(Self::install_cb_helper),
-                error_box as *mut _,
+                Some(install_cb_helper),
+                tx_box as *mut _,
             )
         };
-        let (result, description) = rx.recv().expect("Installation status cannot be retrieved. This shouldn't happen.");
-        let error_box = unsafe { Box::from_raw(error_box) };
+        let (result, description) = rx
+            .recv()
+            .expect("Installation status cannot be retrieved. This shouldn't happen.");
+        let _ = unsafe { Box::from_raw(tx_box) }; // reclaim and drop
         if result != InstProxyError::Success {
             return Err((result, description));
         }
 
         Ok(())
-    }
-
-    unsafe extern "C" fn install_cb_helper(command: unsafe_bindings::plist_t, status: unsafe_bindings::plist_t, user_data: *mut ::std::os::raw::c_void) {
-        let callback = Box::from_raw(user_data as *mut InstallCallback);
-        callback(command.into(), status.into());
-        std::mem::forget(callback);
     }
 
     /// Updates a package on the device
@@ -283,7 +295,7 @@ impl InstProxyClient<'_> {
                 std::ptr::null_mut(),
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -322,7 +334,7 @@ impl InstProxyClient<'_> {
                 std::ptr::null_mut(),
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -349,7 +361,7 @@ impl InstProxyClient<'_> {
         let result = unsafe {
             unsafe_bindings::instproxy_lookup_archives(self.pointer, ptr, &mut res_plist)
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -388,7 +400,7 @@ impl InstProxyClient<'_> {
                 std::ptr::null_mut(),
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -426,7 +438,7 @@ impl InstProxyClient<'_> {
                 std::ptr::null_mut(),
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -464,7 +476,7 @@ impl InstProxyClient<'_> {
                 std::ptr::null_mut(),
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -511,7 +523,7 @@ impl InstProxyClient<'_> {
                 &mut res_plist,
             )
         }
-            .into();
+        .into();
         if result != InstProxyError::Success {
             return Err(result);
         }
@@ -543,7 +555,7 @@ impl InstProxyClient<'_> {
                 to_fill_ptr,
             )
         }
-            .into();
+        .into();
 
         if result != InstProxyError::Success {
             return Err(result);
